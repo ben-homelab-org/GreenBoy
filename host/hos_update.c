@@ -104,8 +104,8 @@ static int newest_tag(const char *body, char *tag, size_t cap) {
 #include <string.h>
 
 #define UPDATE_HOST L"api.github.com"
-#define UPDATE_PATH L"/repos/NotRexed/Hookshot/releases/latest"
-#define RELEASES_PAGE L"https://github.com/NotRexed/Hookshot/releases/latest"
+#define UPDATE_PATH L"/repos/RufflezAU/GreenBoy/releases/latest"
+#define RELEASES_PAGE L"https://github.com/RufflezAU/GreenBoy/releases/latest"
 
 /* (a line "name=value" of a small text file, in UTF-8: its value, trimmed) */
 static int read_value(const wchar_t *path, const char *name, char *out, size_t cap) {
@@ -163,11 +163,11 @@ static int latest_tag(const char *have, char *tag, size_t cap) {
     int ok = 0;
     char *body;
     if (nightly_version(have)) {
-        if ((body = get_body(L"github.com", L"/NotRexed/Hookshot/releases/download/nightly/hookshot-setup.txt")))
+        if ((body = get_body(L"github.com", L"/RufflezAU/GreenBoy/releases/download/nightly/hookshot-setup.txt")))
             ok = tag_in(body, tag, cap), free(body);
         return ok;
     }
-    if (strchr(have, '-') && (body = get_body(UPDATE_HOST, L"/repos/NotRexed/Hookshot/releases?per_page=20"))) {
+    if (strchr(have, '-') && (body = get_body(UPDATE_HOST, L"/repos/RufflezAU/GreenBoy/releases?per_page=20"))) {
         ok = newest_tag(body, tag, cap);
         free(body);
         if (ok) return 1;
@@ -187,7 +187,7 @@ static int local_builder(const wchar_t *file, const wchar_t *dir, wchar_t *out, 
 }
 
 void hos_update_check(void) {
-    if (getenv("HOOKSHOT_NO_UPDATE_CHECK") && strcmp(getenv("HOOKSHOT_NO_UPDATE_CHECK"), "0")) return;
+    if (!getenv("HOOKSHOT_CHECK_UPSTREAM") || !strcmp(getenv("HOOKSHOT_CHECK_UPSTREAM"), "0")) return;   /* (opt-in: the address was re-registrable) */
     wchar_t dir[MAX_PATH], file[MAX_PATH + 64];
     DWORD n = hos_game_path_w(dir, MAX_PATH);
     if (!n || n >= MAX_PATH) return;
@@ -330,17 +330,17 @@ static int pipe_tag(const char *cmd, char *tag, size_t cap, int newest) {
 static int latest_tag(const char *have, char *tag, size_t cap) {
     if (nightly_version(have))
         return pipe_tag("curl -fsSL --max-time 8 --retry 2 -A Hookshot-update-check "
-                        "https://github.com/NotRexed/Hookshot/releases/download/nightly/hookshot-linux.txt 2>/dev/null", tag, cap, 0);
+                        "https://github.com/RufflezAU/GreenBoy/releases/download/nightly/hookshot-linux.txt 2>/dev/null", tag, cap, 0);
     if (strchr(have, '-') && pipe_tag("curl -fsSL --max-time 6 --retry 2 -A Hookshot-update-check "
                                       "-H \"Accept: application/vnd.github+json\" "
-                                      "'https://api.github.com/repos/NotRexed/Hookshot/releases?per_page=20' 2>/dev/null", tag, cap, 1))
+                                      "'https://api.github.com/repos/RufflezAU/GreenBoy/releases?per_page=20' 2>/dev/null", tag, cap, 1))
         return 1;
     if (pipe_tag("curl -fsSL --max-time 4 --retry 2 -A Hookshot-update-check "
                  "-H \"Accept: application/vnd.github+json\" "
-                 "https://api.github.com/repos/NotRexed/Hookshot/releases/latest 2>/dev/null", tag, cap, 0))
+                 "https://api.github.com/repos/RufflezAU/GreenBoy/releases/latest 2>/dev/null", tag, cap, 0))
         return 1;
     return pipe_tag("curl -fsSL --max-time 8 --retry 2 -A Hookshot-update-check "
-                    "https://github.com/NotRexed/Hookshot/releases/latest/download/hookshot-linux.txt 2>/dev/null", tag, cap, 0);
+                    "https://github.com/RufflezAU/GreenBoy/releases/latest/download/hookshot-linux.txt 2>/dev/null", tag, cap, 0);
 }
 
 /* the builder an update installed (builder/linux/linux_update.py): <data>/hookshot/builder/versions/<current>/AppRun. The
@@ -365,8 +365,8 @@ static int installed_builder(char *out, size_t cap) {
 }
 
 void hos_update_check(void) {
-    const char *off = getenv("HOOKSHOT_NO_UPDATE_CHECK");
-    if (off && strcmp(off, "0")) return;
+const char *on = getenv("HOOKSHOT_CHECK_UPSTREAM");
+    if (!on || !strcmp(on, "0")) return;   /* (opt-in) */
     char path[MAX_PATH + 64], have[128], builder[MAX_PATH * 2], skipped[128] = "", tag[128];
     DWORD n = hos_game_path_a(path, MAX_PATH);
     if (!n || n >= MAX_PATH) return;
@@ -414,7 +414,7 @@ void hos_update_check(void) {
     if (strncmp(answer, "Update", 6)) return;
     if (!has_builder) {
         if (fork() == 0) {
-            execlp("xdg-open", "xdg-open", "https://github.com/NotRexed/Hookshot/releases/latest", (char *)0);
+            execlp("xdg-open", "xdg-open", "https://github.com/RufflezAU/GreenBoy/releases/latest", (char *)0);
             _exit(127);
         }
         return;

@@ -20,7 +20,6 @@
 #include <cmath>
 
 #include "vk_framegen.h"
-#include "vk_antilag.h"   // (AMD Anti-Lag 2: which game frame a set shows, antilag_frame / antilag_present_frame)
 #include "vk_dlss.h"   // (NVIDIA DLSS Frame Generation through NGX: dlss_fg_frames)
 #include "vk_reflex.h"   // (NVIDIA Reflex: which game frame a set shows, reflex_frame / reflex_present_frame)
 #include "vk_fsr3_inputs.h"   // (AMD FSR 3.1 frame interpolation's depth and motion)
@@ -68,7 +67,6 @@ struct OutSet {
     int64_t due[kMaxMult] = {};
     bool game[kMaxMult] = {};
     uint64_t reflex_id = 0;   // (NVIDIA Reflex: the game frame it was made at, 0 none: its game frame is presented with it)
-    uint64_t antilag_id = 0;  // (AMD Anti-Lag 2: the same, its game frame's present stage)
 };
 struct Job {
     OutSet* set;
@@ -439,7 +437,11 @@ void display_main() {
         }
         if (last_at) {
             const int64_t d = j.at - last_at;
-            if (d > 0 && d < 100000000) interval = (interval * 7 + std::clamp<int64_t>(d, 4000000, 50000000)) / 8;
+            /* (hookshot) the estimate the line of shown frames is laid on: frames under 100 ms apart only and clamped to
+               50 ms, so a game below 10 fps was outside it and one at 15 was read as 20 - the set of frames went out in
+               ~10 ms bursts instead of one frame time apart. 500 ms and 250 ms cover the low rates; a loading hitch is
+               still left out, and the line restarts from now when it has fallen behind. */
+            if (d > 0 && d < 500000000) interval = (interval * 7 + std::clamp<int64_t>(d, 4000000, 250000000)) / 8;
         }
         last_at = j.at;
         if (!stat.since) stat.since = j.at;
@@ -472,7 +474,6 @@ void display_main() {
             for (int k = 0; k < shown; k++) {
                 present_kind.store(timed ? (j.set->game[k] ? 0 : 1) : k < j.set->made ? 1 : 0);
                 reflex_present_frame = (timed ? j.set->game[k] : k == j.set->made) ? j.set->reflex_id : 0;
-                antilag_present_frame = (timed ? j.set->game[k] : k == j.set->made) ? j.set->antilag_id : 0;
                 present_defer_into = &pending[k];
                 present_image(j.set->frame[k].image, fg.w, fg.h, nullptr, j.set->frame[k].view);
                 present_defer_into = nullptr;
@@ -497,7 +498,6 @@ void display_main() {
                 present_kind.store(timed ? (j.set->game[k] ? 0 : 1) : k < j.set->made ? 1 : 0);
                 // (NVIDIA Reflex: the set's game frame is presented as the game frame it was made at, made frames as none)
                 reflex_present_frame = (timed ? j.set->game[k] : k == j.set->made) ? j.set->reflex_id : 0;
-                antilag_present_frame = (timed ? j.set->game[k] : k == j.set->made) ? j.set->antilag_id : 0;
                 present_image(j.set->frame[k].image, fg.w, fg.h, nullptr, j.set->frame[k].view);
             }
             menu_note_frame(!timed && k == j.set->made);
@@ -515,34 +515,7 @@ void display_main() {
     }
 }
 
-// (hookshot) The last sets' makers (framegen_maker): each framegen_record notes its set's on the replay thread; the menu's
-// thread reads the counts. A ring of kMakerSets, the counts of each maker in it
-constexpr int kMakerSets = 64;
-std::atomic<int> maker_count[4] = {kMakerSets, 0, 0, 0};
-uint8_t maker_ring[kMakerSets] = {};
-int maker_pos = 0;
-std::atomic<int64_t> maker_at{0};
-
-void note_maker(FgMaker m) {
-    uint8_t& slot = maker_ring[maker_pos];
-    maker_count[slot].fetch_sub(1, std::memory_order_relaxed);
-    slot = (uint8_t)m;
-    maker_count[slot].fetch_add(1, std::memory_order_relaxed);
-    maker_pos = (maker_pos + 1) % kMakerSets;
-    maker_at.store(now_ns(), std::memory_order_relaxed);
-}
-
 } // namespace
-
-FgMaker framegen_maker() {
-    // (none recorded for half a second: Frame generation off, or the window's presents without it)
-    if (now_ns() - maker_at.load(std::memory_order_relaxed) > 500000000) return FgMaker::None;
-    const int b = maker_count[(int)FgMaker::BuiltIn].load(std::memory_order_relaxed);
-    const int d = maker_count[(int)FgMaker::Dlss].load(std::memory_order_relaxed);
-    const int f = maker_count[(int)FgMaker::Fsr3].load(std::memory_order_relaxed);
-    if (!b && !d && !f) return FgMaker::None;
-    return d >= b && d >= f ? FgMaker::Dlss : f >= b ? FgMaker::Fsr3 : FgMaker::BuiltIn;
-}
 
 // The Insert menu's Frame generation is off at 0. While it was ignored, every present still copied the frame and
 // reduced it to luma (framegen_record), then a second thread showed it. Open areas paid for that on a full GPU and
@@ -817,13 +790,9 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
         set->busy = true;
         fg.next_set = (fg.next_set + 1) % 3;
     }
-    // (the multiplier the sets were made for, ensure_size above: the row read again here could be one step up by now, the
-    // menu runs on the display thread, and the set's last image would be one that was never made)
-    const int cur = fg.cur, prev = cur ^ 1, m = fg.mult;
-    const bool auto_rate = opts.framegen == 1;   // (read once, for the same reason)
+    const int cur = fg.cur, prev = cur ^ 1, m = multiplier();
     const bool blend = fg.have_prev && !gap;
     set->reflex_id = reflex_frame();   // (NVIDIA Reflex: the game frame this set shows, vk_reflex.cpp)
-    set->antilag_id = antilag_frame();   // (AMD Anti-Lag 2: the same, vk_antilag.cpp)
     static uint64_t sequence = 0;
     sequence++;
     const uint32_t uw = (uint32_t)w, uh = (uint32_t)h;
@@ -834,7 +803,7 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
     pass(cmd, fg.luma, {{fg.frames[cur].view, fg.nearest}, {fg.lumas[cur].view, VK_NULL_HANDLE}}, qw, qh);
     set->made = 0;
     set->shown = -1;
-    if (auto_rate) {   // (Auto: a frame for each of the display's refreshes, at its own time)
+    if (opts.framegen == 1) {   // (Auto: a frame for each of the display's refreshes, at its own time)
         const int mhz = display_refresh_mhz();
         const int64_t period = (int64_t)(1e12 / (mhz > 0 ? mhz : 60000));
         float t[kMaxMult];
@@ -868,7 +837,6 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
         }
         set->shown = n;
         set->made = n > 0 && !set->game[n - 1] ? n : std::max(0, n - 1);   // (for framegen_made_image: any made)
-        note_maker(flow ? FgMaker::BuiltIn : FgMaker::None);   // (Auto: the renderer's own, DLSS-G is not asked)
         full_barrier(cmd);
         fg.have_prev = true;
         fg.cur = prev;
@@ -885,11 +853,9 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
         for (int k = 0; k < m - 1; k++) outs[k] = set->frame[k].image, views[k] = set->frame[k].view;
         set->made = dlss_fg_frames(cmd, fg.frames[cur].image, fg.frames[cur].view, uw, uh, m - 1, outs, views, blend, sequence);
     }
-    FgMaker maker = set->made ? FgMaker::Dlss : FgMaker::None;
     // (hookshot) At 2x, AMD FSR 3.1's frame interpolation where it runs; it makes the midpoint only, so 3x and more (and Auto,
     // above) stay with the interpolation below, as does any present it does not take
     if (set->made == 0 && blend && m == 2 && fsr3fi::frames_wanted()) set->made = fsr3fi_frame(cmd, *set, cur, uw, uh, sequence);
-    if (maker == FgMaker::None && set->made) maker = FgMaker::Fsr3;
     if (set->made == 0 && blend && m > 1) {
         pass(cmd, fg.flow, {{fg.lumas[prev].view, fg.nearest}, {fg.lumas[cur].view, fg.nearest},
                             {fg.flows[0].view, VK_NULL_HANDLE}}, cw, ch);
@@ -901,9 +867,7 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
                  uw, uh, &t, 4);
         }
         set->made = m - 1;
-        maker = FgMaker::BuiltIn;
     }
-    note_maker(maker);
     const VkImageCopy c{{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0},
                         {uw, uh, 1}};
     vkCmdCopyImage(cmd, fg.frames[cur].image, VK_IMAGE_LAYOUT_GENERAL, set->frame[set->made].image,

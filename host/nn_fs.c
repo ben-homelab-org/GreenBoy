@@ -359,9 +359,7 @@ HLE(_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci) {
     if (want_write && !writable) { if (away) hos_vcore_back(); RET(R_PATH_NOT_FOUND); return; }
     /* (mkw-recomp) HOS_NO_MOVIES=1: MKW's WebM movies (cup openings, billboards, emblems) are not found, and the
        game goes on without them (decoded by nn_video.c otherwise) */
-    static int no_movies = -1;
-    if (no_movies < 0) no_movies = env_on("HOS_NO_MOVIES");
-    if (!want_write && no_movies) {
+    if (!want_write && env_on("HOS_NO_MOVIES")) {
         const size_t n = strlen(g);
         if (n > 5 && !_stricmp(g + n - 5, ".webm")) {
             static int logged;
@@ -376,9 +374,7 @@ HLE(_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci) {
       if (!want_write && hos_ultrawide_redirect(g, alt, sizeof alt)) snprintf(path, sizeof path, "%s", alt); }
     if (!want_write && hos_blank_cached_icon(g, path)) { if (away) hos_vcore_back(); RET(R_PATH_NOT_FOUND); return; }
     {   /* HOS_FS_OVERLAY=<folder> (a test): a file of the game's data found there is read in place of the game's own */
-        static const char *ov = NULL;
-        static int ov_init = 0;
-        if (!ov_init) { ov = getenv("HOS_FS_OVERLAY"); ov_init = 1; }
+        const char *ov = getenv("HOS_FS_OVERLAY");
         const char *rel = !want_write && ov ? strstr(g, ":/") : NULL;
         if (rel) {
             char alt[HOS_FS_PATH];
@@ -390,7 +386,7 @@ HLE(_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci) {
         }
     }
     HANDLE h = CreateFileA(path, GENERIC_READ | (want_write ? GENERIC_WRITE : 0), FILE_SHARE_READ | FILE_SHARE_WRITE,
-                           NULL, OPEN_EXISTING, want_write ? FILE_ATTRIBUTE_NORMAL : FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+                           NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (away) hos_vcore_back();
     if (h == INVALID_HANDLE_VALUE) {
         if (hos_trace || fs_trace()) hos_log("fs: OpenFile(%s): not found", g);
@@ -473,11 +469,7 @@ HLE(_ZN2nn2fs9WriteFileENS0_10FileHandleElPKvmRKNS0_11WriteOptionE) {
     ov.OffsetHigh = (DWORD)(ARG(1) >> 32);
     DWORD put = 0;
     /* (hookshot) from guest memory only, and the whole size: a DWORD cut wrote less than asked and said so */
-    if (ARG(3) <= 0xFFFFFFFFu && hos_guest_range(ARG(2), ARG(3))) {
-        const int away = hos_vcore_away();
-        WriteFile(fh->h, GP(ARG(2)), (DWORD)ARG(3), &put, &ov);
-        if (away) hos_vcore_back();
-    }
+    if (ARG(3) <= 0xFFFFFFFFu && hos_guest_range(ARG(2), ARG(3))) WriteFile(fh->h, GP(ARG(2)), (DWORD)ARG(3), &put, &ov);
     RET(put == ARG(3) ? 0 : 0x2EE202);
 }
 HLE(_ZN2nn2fs11SetFileSizeENS0_10FileHandleEl) {
@@ -628,12 +620,8 @@ HLE(_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci) {
     G64(ARG(0)) = new_handle(dh);
     RET(0);
 }
-/* (hookshot) A directory's listing is read, counted and closed under one lock: a CloseDirectory on another guest thread freed
-   the handle (and its find handle) while a ReadDirectory or GetDirectoryEntryCount still walked it */
-static SRWLOCK dir_lock = SRWLOCK_INIT;
 /* ReadDirectory(long* count, DirectoryEntry* entries, DirectoryHandle, long max) */
 HLE(_ZN2nn2fs13ReadDirectoryEPlPNS0_14DirectoryEntryENS0_15DirectoryHandleEl) {
-    AcquireSRWLockExclusive(&dir_lock);
     Handle *dh = get_handle(c, ARG(2));
     int64_t n = 0, max = (int64_t)ARG(3);
     while (n < max && !dh->find_done) {
@@ -660,13 +648,11 @@ HLE(_ZN2nn2fs13ReadDirectoryEPlPNS0_14DirectoryEntryENS0_15DirectoryHandleEl) {
         G64(e + 0x308) = x->size;
         n++;
     }
-    ReleaseSRWLockExclusive(&dir_lock);
     G64(ARG(0)) = (uint64_t)n;
     RET(0);
 }
 /* (hookshot) GetDirectoryEntryCount(long* count, DirectoryHandle): every entry the open mode lists, read or not */
 HLE(_ZN2nn2fs22GetDirectoryEntryCountEPlNS0_15DirectoryHandleE) {
-    AcquireSRWLockExclusive(&dir_lock);
     Handle *dh = get_handle(c, ARG(1));
     int64_t n = 0;
     WIN32_FIND_DATAA fd;
@@ -682,16 +668,13 @@ HLE(_ZN2nn2fs22GetDirectoryEntryCountEPlNS0_15DirectoryHandleE) {
     }
     for (int i = 0; i < dh->nextras; i++)
         n += (dh->extras[i].is_dir && (dh->is_dir & 1)) || (!dh->extras[i].is_dir && (dh->is_dir & 2));
-    ReleaseSRWLockExclusive(&dir_lock);
     G64(ARG(0)) = (uint64_t)n;
     RET(0);
 }
 HLE(_ZN2nn2fs14CloseDirectoryENS0_15DirectoryHandleE) {
-    AcquireSRWLockExclusive(&dir_lock);
     Handle *dh = get_handle(c, ARG(0));
     if (dh->find != INVALID_HANDLE_VALUE) FindClose(dh->find);
     free_handle(ARG(0));
-    ReleaseSRWLockExclusive(&dir_lock);
     free(dh->extras);
     free(dh);
 }

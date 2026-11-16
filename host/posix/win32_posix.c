@@ -159,13 +159,15 @@ void GetSystemTimeAsFileTime(FILETIME *ft) {
     ft->dwLowDateTime = (DWORD)t, ft->dwHighDateTime = (DWORD)(t >> 32);
 }
 typedef struct { HObj h; int64_t due; } HTimer;
-/* A high-resolution timer (flag 2) is waited on by the thread that makes it (hos_thread.c sleep_ns: one a thread), so
-   that thread's timer slack goes from the kernel's 50 us to 1 us: the game's idle job workers sleep 20 us at a time, and
-   with the slack each such sleep would last 70. */
+/* A high-resolution timer (CREATE_WAITABLE_TIMER_HIGH_RESOLUTION) is waited on by the thread that makes it (hos_thread.c
+   sleep_ns for host sleeps, vk_framegen.cpp wait_until_near), so that thread's timer slack goes from the kernel's 50 us
+   to 1 us. Guest short sleeps pass flags 0 so idle worker polls keep the 50 us coalescing slack on top of sleep_ns's
+   250 us floor instead of waking Zen 2 cores hundreds of thousands of times a second. */
 HANDLE CreateWaitableTimerExW(void *attr, LPCWSTR name, DWORD flags, DWORD access) {
     (void)attr, (void)name, (void)access;
-    if (flags & 2) prctl(PR_SET_TIMERSLACK, 1000UL, 0, 0, 0);
+    if (flags & CREATE_WAITABLE_TIMER_HIGH_RESOLUTION) prctl(PR_SET_TIMERSLACK, 1000UL, 0, 0, 0);
     HTimer *t = (HTimer *)calloc(1, sizeof *t);
+    if (!t) { last_error = ERROR_NOT_ENOUGH_MEMORY; return NULL; }
     t->h.type = H_TIMER;
     return t;
 }
@@ -605,6 +607,8 @@ BOOL GetLogicalProcessorInformation(SYSTEM_LOGICAL_PROCESSOR_INFORMATION *info, 
     int keys[64][2];
     for (int i = 0; i < cpus; i++) {
         char p[128];
+        snprintf(p, sizeof p, "/sys/devices/system/cpu/cpu%d/online", i);
+        if (read_int(p) == 0) continue;
         snprintf(p, sizeof p, "/sys/devices/system/cpu/cpu%d/topology/core_id", i);
         core_of[i] = read_int(p);
         snprintf(p, sizeof p, "/sys/devices/system/cpu/cpu%d/topology/physical_package_id", i);
@@ -1313,13 +1317,7 @@ MMRESULT waveOutWrite(HWAVEOUT hw, WAVEHDR *h, UINT size) {
     (void)size;
     WaveOut *w = (WaveOut *)hw;
     pthread_mutex_lock(&w->mu);
-    if (w->count >= 60) {
-        WAVEHDR *old = w->q[w->head];
-        __atomic_store_n(&old->dwFlags, (old->dwFlags & ~(DWORD)WHDR_INQUEUE) | WHDR_DONE, __ATOMIC_RELEASE);
-        w->head = (w->head + 1) % 64;
-        w->count--;
-        w->pos = 0;
-    }
+    if (w->count == 64) { pthread_mutex_unlock(&w->mu); return MMSYSERR_ERROR; }
     h->dwFlags = (h->dwFlags & ~(DWORD)WHDR_DONE) | WHDR_INQUEUE;
     w->q[(w->head + w->count) % 64] = h;
     w->count++;

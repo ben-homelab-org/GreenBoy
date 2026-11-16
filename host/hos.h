@@ -53,10 +53,6 @@ int hos_game_is_mkw(void);
 #define HOS_GAME_TITLE "Hookshot"
 void hos_commit(uint64_t addr, uint64_t size);         /* (mkw_glue.c) guest pages made usable by host APIs */
 int hos_mem_region(uint64_t addr, uint64_t size);      /* (hos_mem.c) the control bridge: 0 if not wholly in mapped guest memory */
-void hos_guard_pages(uint64_t guest, uint64_t size);   /* scoped GPU page-guard write tracking */
-void hos_unguard_pages(uint64_t guest, uint64_t size);
-int hos_guard_on_write(uint64_t guest);
-int64_t hos_drain_dirty_pages(uint32_t **pages, int rearm);
 #if defined(A64_WRITE_TRACK) && !defined(__EMSCRIPTEN__)
 void hos_mark_written(const void *p, size_t n);   /* (hos_mem.c: guest memory written by host code, native soft watch) */
 #define HOS_WRITTEN(p, n) hos_mark_written((p), (n))
@@ -113,8 +109,6 @@ void hos_thread_set_name(HosThread *t, const char *name);
 void hos_thread_pin(void *h, const char *name);   /* HOS_PIN: host CPU affinity by thread name */
 int hos_game_cores(void);   /* totk_cores.c: HOS_GAME_CORES, or 0 */
 const char *hos_thread_name(HosThread *t);
-int hos_thread_serial(const HosThread *t);   /* one of the frame's serial threads (game thread, Presentation Thread) */
-int64_t hos_spin_ns(void);   /* the calling thread's spin before a wait sleeps, ns (HOS_SPIN_US, HOS_SPIN_OTHER_US) */
 void hos_thread_affinity(HosThread *t, int ideal, uint64_t mask);
 uint64_t hos_thread_mask(HosThread *t);
 int hos_thread_priority(HosThread *t, int set, int value);

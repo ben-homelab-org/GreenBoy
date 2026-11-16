@@ -10,15 +10,16 @@
 #endif
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdbool.h>
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION   /* (older Windows SDKs lack it: Windows 10 1803 and later take it) */
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 #include <emmintrin.h>
-#ifdef __EMSCRIPTEN__
+#if !defined(_WIN32)
 #include <sched.h>
+#endif
+#ifdef __EMSCRIPTEN__
 #include <stdatomic.h>
 #include <unistd.h>
 #endif
@@ -33,7 +34,6 @@ struct HosThread {
     char name[48];
     HANDLE handle;
     int started;
-    int serial;   /* one of the frame's serial threads (hos_thread_serial), set with the name */
     /* the kernel side (hos_svc.c): this thread's Horizon handle and the event it blocks on */
     uint32_t kernel_handle;
     HANDLE wake;
@@ -487,7 +487,6 @@ Ctx *hos_boot_main_thread(uint64_t stack_size) {
     t->ideal_core = 0;
     t->started = 1;
     snprintf(t->name, sizeof t->name, "MainThread");
-    __atomic_store_n(&t->serial, 1, __ATOMIC_RELAXED);
     DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &t->handle, 0, FALSE,
                     DUPLICATE_SAME_ACCESS);   /* a real handle, for the profiler */
     SetThreadDescription(GetCurrentThread(), L"MainThread");   /* (HOS_SAMPLE finds threads by it) */
@@ -596,56 +595,9 @@ void hos_thread_destroy(HosThread *t) {
     free(t);
 }
 
-/* The frame's serial threads: OoT's game thread (sead::MainThread, the boot thread's MainThread before the game names
-   it) and its Presentation Thread. A frame waits on each in turn, so a wait of theirs that ends late ends the frame late;
-   the host keeps their short waits short (sleep_ns's pollers, the spin before a wait sleeps: hos_spin_ns). By name, as
-   the game names them: kept in the thread's record when it is named, not read from the name while it may change. */
-static int serial_name(const char *name) { return strstr(name, "MainThread") || !strcmp(name, "Presentation Thread"); }
-int hos_thread_serial(const HosThread *t) { return t && __atomic_load_n(&t->serial, __ATOMIC_RELAXED); }
-
-/* The processors this process may run on (its affinity mask, as the game starts with it): Windows with one processor
-   group; 0 = not known (more than one group, or elsewhere). Up to SHORT_SLEEP_TIMER_THREADS of them, the host keeps the
-   behaviour measured best there (sleep_ns's timer, hos_spin_ns's one spin). */
-enum { SHORT_SLEEP_TIMER_THREADS = 6 };
-static int process_threads(void) {
-    int threads = 0;
-#if defined(_WIN32)   /* (measured on Windows only) */
-    /* (with more than one processor group the mask is one group's, not the process's: not known then) */
-    DWORD_PTR proc = 0, sys = 0;
-    if (GetActiveProcessorGroupCount() == 1 && GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys))
-        threads = __builtin_popcountll((uint64_t)proc);
-#endif
-    return threads;
-}
-
-/* How long a wait spins before it sleeps (nn_os_sync.c's events, queues and mutexes; hos_svc.c's mutexes), in ns, for the
-   calling thread: HOS_SPIN_US (20 us) on the frame's serial threads, HOS_SPIN_OTHER_US (5 us, never more than HOS_SPIN_US)
-   on the others, where there are more than SHORT_SLEEP_TIMER_THREADS processors. With 6 or fewer (or not known), every
-   thread keeps HOS_SPIN_US unless HOS_SPIN_OTHER_US is set: there the short spin saved no CPU and cost 1.6 % fps (6 pairs,
-   Hyrule, 6 of 16 processors), as a 24-thread run with only 2 pollers did (1.7 %). A sleeper runs again 6.6-8.4 us after its signal (HOS_WAKE_LAT, Hyrule), so a spin much longer than that
-   mostly burns its thread's time: 90 % of the spin's 15 % of a core in Hyrule was on the job workers and the actor
-   executors. 5 us for every thread cut the process's CPU a frame 3.3 % at the same fps (6 pairs, Hyrule, 16 threads); the
-   serial threads keep 20 us, as their wait ends are on the frame's path. HOS_SPIN_OTHER_US=20: as before, one spin for all;
-   HOS_SPIN_US=0: no spin. */
-int64_t hos_spin_ns(void) {
-    static int64_t both = -1;   /* (the serial threads' ns << 32 | the others': one atomic word, chosen once) */
-    int64_t b = __atomic_load_n(&both, __ATOMIC_RELAXED);
-    if (b < 0) {
-        const char *e = getenv("HOS_SPIN_US"), *o = getenv("HOS_SPIN_OTHER_US");
-        int64_t s = e ? atoll(e) : 20, other = o ? atoll(o) : process_threads() > SHORT_SLEEP_TIMER_THREADS ? 5 : s;   /* (us, clamped before they become ns) */
-        s = (s < 0 ? 0 : s > 1000000 ? 1000000 : s) * 1000;
-        other = (other < 0 ? 0 : other > 1000000 ? 1000000 : other) * 1000;
-        other = other > s ? s : other;
-        b = s << 32 | other;
-        __atomic_store_n(&both, b, __ATOMIC_RELAXED);
-    }
-    return hos_thread_serial(hos_self()) ? b >> 32 : b & 0xFFFFFFFF;
-}
-
 void hos_thread_set_name(HosThread *t, const char *name) {
     snprintf(t->name, sizeof t->name, "%s", name);
-    bg_classify(t);   /* (the background threads' share, before the name is used for pinning) */
-    __atomic_store_n(&t->serial, serial_name(t->name), __ATOMIC_RELAXED);   /* (atomic: SetThreadName may name another thread) */
+    bg_classify(t);
     if (t->handle) {
         wchar_t w[48];
         MultiByteToWideChar(CP_UTF8, 0, t->name, -1, w, 48);
@@ -736,20 +688,6 @@ static uint64_t pick_reserved_core(const uint64_t *masks, const unsigned char *c
         }
     }
     if (logical < 8 || fast < 4) return 0;
-
-    // One-time debug logging
-    static bool logged = false;
-    if (!logged) {
-        logged = true;
-        hos_log("vk: reserved core selection: %d cores, %d logical, best class=%d, fast cores=%d, selected=%#llx",
-                n, logical, best, fast, (unsigned long long)last);
-        for (int i = 0; i < n; i++) {
-            if (masks[i]) {
-                hos_log("vk:   core %d: mask=%#llx, class=%d, popcount=%d",
-                        i, (unsigned long long)masks[i], classes[i], __builtin_popcountll(masks[i]));
-            }
-        }
-    }
     return last;
 }
 #if defined(_WIN32)
@@ -804,63 +742,6 @@ uint64_t hos_cache_cpus(void) {
     return mask;
 }
 /* (pick_reserved_core over the calling thread's group's cores; *cores: how many, 0 when they could not be read) */
-static uint64_t last_fastest_core_legacy(int *cores) {
-    SYSTEM_LOGICAL_PROCESSOR_INFORMATION info[256];
-    DWORD len = sizeof info;
-    if (!GetLogicalProcessorInformation(info, &len)) {
-        hos_log("vk: GetLogicalProcessorInformation failed: %lu", GetLastError());
-        return 0;
-    }
-
-    int logical = 0;
-    int current_core = 0;
-    uint64_t masks[256];
-    unsigned char classes[256];
-
-    int pcore_candidates = 0;
-    int ecore_candidates = 0;
-
-    for (DWORD i = 0; i < len / sizeof info[0] && current_core < 256; i++) {
-        if (info[i].Relationship == RelationProcessorCore) {
-            uint64_t mask = (uint64_t)info[i].ProcessorMask;
-            int popcount = __builtin_popcountll(mask);
-            logical += popcount;
-
-            // Heuristic: cores with 2+ logical processors = P-cores (with HT)
-            // cores with 1 logical processor = E-cores (no HT)
-            if (popcount >= 2) {
-                classes[current_core] = 1;  // P-core
-                pcore_candidates++;
-            } else {
-                classes[current_core] = 0;  // E-core
-                ecore_candidates++;
-            }
-            masks[current_core] = mask;
-            current_core++;
-        }
-    }
-
-    *cores = current_core;
-
-    hos_log("vk: legacy API fallback: %d cores, %d logical, P-candidates=%d, E-candidates=%d",
-            current_core, logical, pcore_candidates, ecore_candidates);
-
-    // If mixed core types detected, use enhanced picker
-    if (pcore_candidates > 0 && ecore_candidates > 0) {
-        hos_log("vk: Intel hybrid CPU detected via legacy API heuristic");
-        return pick_reserved_core(masks, classes, current_core);
-    }
-
-    // Single CPU type - use original logic (last core)
-    uint64_t last = 0;
-    for (int i = 0; i < current_core; i++) {
-        if ((uint64_t)masks[i] > last) last = (uint64_t)masks[i];
-    }
-    if (logical >= 8) return last;
-    return 0;
-}
-
-/* (pick_reserved_core over the calling thread's group's cores; *cores: how many, 0 when they could not be read) */
 static uint64_t last_fastest_core(int *cores) {
     static uint64_t masks[256];
     static unsigned char classes[256];
@@ -869,18 +750,10 @@ static uint64_t last_fastest_core(int *cores) {
     *cores = 0;
     GROUP_AFFINITY ga;
     const WORD group = GetThreadGroupAffinity(GetCurrentThread(), &ga) ? ga.Group : 0;
-    if (GetLogicalProcessorInformationEx(RelationProcessorCore, NULL, &len) || GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
-        hos_log("vk: GetLogicalProcessorInformationEx failed: %lu", GetLastError());
-        return last_fastest_core_legacy(cores);
-    }
+    if (GetLogicalProcessorInformationEx(RelationProcessorCore, NULL, &len) || GetLastError() != ERROR_INSUFFICIENT_BUFFER)
+        return 0;
     char *buf = (char *)malloc(len);
-    if (!buf) {
-        hos_log("vk: failed to allocate buffer for processor info");
-        return last_fastest_core_legacy(cores);
-    }
-
-    bool success = false;
-    if (GetLogicalProcessorInformationEx(RelationProcessorCore, (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *)buf, &len)) {
+    if (buf && GetLogicalProcessorInformationEx(RelationProcessorCore, (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *)buf, &len))
         for (DWORD at = 0; at < len && n < 256;) {
             const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *e = (const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *)(buf + at);
             if (!e->Size) break;
@@ -891,67 +764,7 @@ static uint64_t last_fastest_core(int *cores) {
             }
             at += e->Size;
         }
-        success = true;
-    }
-
     free(buf);
-
-    if (!success || n == 0) {
-        hos_log("vk: extended API failed or no cores found, trying legacy API with Intel hybrid detection");
-        return last_fastest_core_legacy(cores);
-    }
-
-    *cores = n;
-    return pick_reserved_core(masks, classes, n);
-}
-#endif
-#if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
-/* (hookshot) A Linux cpulist ("0-7", "0-11,16-19") as a mask of logical processors 0-63; 0 when it does not parse.
-   (tests/test_reserved_core.py) */
-static uint64_t parse_cpu_list(const char *s) {
-    uint64_t mask = 0;
-    while (*s && *s != '\n') {
-        char *end;
-        long a = strtol(s, &end, 10), b = a;
-        if (end == s || a < 0) return 0;
-        s = end;
-        if (*s == '-') {
-            b = strtol(++s, &end, 10);
-            if (end == s || b < a) return 0;
-            s = end;
-        }
-        for (long i = a; i <= b && i < 64; i++) mask |= 1ull << i;
-        if (*s == ',') s++;
-        else if (*s && *s != '\n') return 0;
-    }
-    return mask;
-}
-/* (hookshot) Linux: Windows' EfficiencyClass has no file of its own, but on Intel's hybrid CPUs the kernel lists the
-   performance cores' logical processors in /sys/devices/cpu_core/cpus (the hybrid PMU; the efficiency cores are in
-   cpu_atom). Without it the last core was kept, and on those CPUs that is an efficiency core: a Core Ultra 7 265KF's
-   logical processor 19 (P-cores 0-7, E-cores 8-19). Those cores are class 1, the others 0, and pick_reserved_core
-   chooses as on Windows. *cores: 0 when the file is not there (a CPU of one kind, AMD, an older kernel): as before. */
-static uint64_t last_fastest_core(int *cores) {
-    *cores = 0;
-    char line[256] = {0};
-    FILE *f = fopen("/sys/devices/cpu_core/cpus", "r");
-    if (!f) return 0;
-    const bool read = fgets(line, sizeof line, f) != NULL;
-    fclose(f);
-    const uint64_t fast = read ? parse_cpu_list(line) : 0;
-    if (!fast) return 0;
-    SYSTEM_LOGICAL_PROCESSOR_INFORMATION info[64];
-    DWORD len = sizeof info;
-    if (!GetLogicalProcessorInformation(info, &len)) return 0;
-    uint64_t masks[64];
-    unsigned char classes[64];
-    int n = 0;
-    for (DWORD i = 0; i < len / sizeof info[0] && n < 64; i++)
-        if (info[i].Relationship == RelationProcessorCore) {
-            masks[n] = (uint64_t)info[i].ProcessorMask;
-            classes[n] = (masks[n] & fast) != 0;
-            n++;
-        }
     *cores = n;
     return pick_reserved_core(masks, classes, n);
 }
@@ -960,25 +773,7 @@ uint64_t hos_reserved_cpus(void) {
     static uint64_t mask = ~0ull;
     if (mask != ~0ull) return mask;
     mask = 0;
-
-    // Allow explicit hex mask override for testing
-    const char* override = getenv("HOS_RESERVE_CORE_MASK");
-    if (override) {
-        char* endptr;
-        mask = strtoull(override, &endptr, 16);
-        if (*endptr != '\0') {
-            hos_log("vk: HOS_RESERVE_CORE_MASK '%s' is not a valid hex value, ignoring", override);
-            mask = 0;
-        } else {
-            hos_log("vk: HOS_RESERVE_CORE_MASK override: %#llx", (unsigned long long)mask);
-        }
-        return mask;
-    }
-
-    if (getenv("HOS_RESERVE_CORE") && !atoi(getenv("HOS_RESERVE_CORE"))) {
-        hos_log("vk: HOS_RESERVE_CORE=0, no core reserved");
-        return mask;
-    }
+    if (getenv("HOS_RESERVE_CORE") && !atoi(getenv("HOS_RESERVE_CORE"))) return mask;
 #if defined(_WIN32)
     /* (hookshot) none where the game is kept to the cores of the largest L3 (hos_cache_cpus): they are 8 cores on the CPUs
        measured (a 9950X3D, SMT off), and with one of them kept for the replay the game's threads had 7. In the market the replay
@@ -989,21 +784,7 @@ uint64_t hos_reserved_cpus(void) {
     {
         int cores = 0;
         const uint64_t fast = last_fastest_core(&cores);
-        if (cores) {
-            mask = fast;
-            hos_log("vk: reserved core mask (enhanced): %#llx (%d cores)", (unsigned long long)mask, cores);
-            return mask;
-        }
-    }
-#elif !defined(__EMSCRIPTEN__)
-    {
-        int cores = 0;
-        const uint64_t fast = last_fastest_core(&cores);
-        if (cores) {
-            mask = fast;
-            hos_log("vk: reserved core mask (hybrid, /sys/devices/cpu_core): %#llx (%d cores)", (unsigned long long)mask, cores);
-            return mask;
-        }
+        if (cores) return mask = fast;
     }
 #else
     /* Linux: kept only when the replay thread is there to use it (RX_VK_ASYNC=1). The synchronous replay, the default,
@@ -1031,7 +812,6 @@ uint64_t hos_reserved_cpus(void) {
             if ((uint64_t)info[i].ProcessorMask > last) last = (uint64_t)info[i].ProcessorMask;
         }
     if (logical >= 8) mask = last;
-    hos_log("vk: reserved core mask (fallback): %#llx", (unsigned long long)mask);
     return mask;
 }
 
@@ -1079,14 +859,12 @@ uint64_t hos_ticks(void) { return recomp_cntpct(NULL); }
 int64_t hos_now_ns(void) {
     static LARGE_INTEGER freq;
     static int64_t ns_per_tick;
-    static int freq_ready;
     LARGE_INTEGER now;
-    if (!__atomic_load_n(&freq_ready, __ATOMIC_ACQUIRE)) {
+    if (!freq.QuadPart) {
         LARGE_INTEGER f;
         QueryPerformanceFrequency(&f);
         ns_per_tick = 1000000000LL % f.QuadPart == 0 ? 1000000000LL / f.QuadPart : 0;
         freq = f;
-        __atomic_store_n(&freq_ready, 1, __ATOMIC_RELEASE);
     }
     QueryPerformanceCounter(&now);
     if (ns_per_tick) return (int64_t)now.QuadPart * ns_per_tick;
@@ -1094,36 +872,47 @@ int64_t hos_now_ns(void) {
 }
 
 static void sleep_ns(int64_t ns, int guest);
+#if !defined(__EMSCRIPTEN__)
+static int physical_cores(void) {
+#if defined(_WIN32)
+    /* (with more than one processor group the list is one group's, not the machine's: not known then) */
+    if (GetActiveProcessorGroupCount() != 1) return 0;
+#endif
+    SYSTEM_LOGICAL_PROCESSOR_INFORMATION stack[256], *info = stack;
+    DWORD len = sizeof stack;
+    if (!GetLogicalProcessorInformation(info, &len)) {
+        if (len <= sizeof stack) return 0;
+        info = (SYSTEM_LOGICAL_PROCESSOR_INFORMATION *)malloc(len);
+        if (!info || !GetLogicalProcessorInformation(info, &len)) {
+            free(info);
+            return 0;
+        }
+    }
+    int cores = 0;
+    for (DWORD i = 0; i < len / sizeof info[0]; i++)
+        if (info[i].Relationship == RelationProcessorCore && info[i].ProcessorMask) cores++;
+    if (info != stack) free(info);
+    return cores;
+}
+#endif
 /* How sleeps under a millisecond wait: 0, all yield until their time; 1, the game's own (SleepThread) wait on the timer,
-   which wakes about 0.5 ms late, and the host's (the frame limiter, the audio renderer) yield; 2, all wait on the timer.
-   asked: the value of HOS_SHORT_SLEEP_TIMER, NULL when it is not set; set, it is read by env_on's rule (on: the timer for
-   all, 2; off: yielding for all, 0). threads: the logical processors this process may run on, 0 when not known. Not set:
-   1 with SHORT_SLEEP_TIMER_THREADS of them or fewer, which is no more than the game's six cores, else 0.
+   which wakes about 0.25-0.5 ms late, and the host's (the frame limiter, the audio renderer) yield; 2, all wait on the
+   timer. asked: the value of HOS_SHORT_SLEEP_TIMER, NULL when it is not set; set, it is read by env_on's rule (on: the
+   timer for all, 2; off: yielding for all, 0). threads: the smaller of the logical processors this process may run on and
+   the machine's physical cores, 0 when neither is known. Not set: 1 with SHORT_SLEEP_TIMER_THREADS of them or fewer,
+   which is no more than the game's six cores (a 4-core / 8-thread Steam Deck, a 6-core desktop, or a desktop held to 4
+   or 6 logical processors), else 0.
    OoT's idle job workers sleep 20 us and look again, about 7,600 times a second, and a yielding loop keeps a processor
-   busy for each: with so few processors that is time the frame's threads need. Measured with the game held to part of a
-   5700X3D: on 4 threads Hyrule Field went from 47 to 51 fps and lost its long frames (over 250 ms in 2 of 4 runs
-   yielding, in none with the timer), Kokiri's worst frame went from 53-422 ms to 30 ms; on 6 the frame rate stayed and a
-   frame's CPU time fell 9 %. On 8 threads and more yielding stays: with the timer for all sleeps there were no long
-   frames either way and Kokiri lost 0.2 fps under its cap, and the timer made TOTK's 20 us waits for its job workers 25x
-   longer, ~2000 a second on the frame's critical path. */
+   busy for each (its virtual core given up first): with so few cores that is time and power the frame and GPU need.
+   Measured with the game held to part of a 5700X3D: on 4 threads Hyrule Field went from 47 to 51 fps and lost its long
+   frames (over 250 ms in 2 of 4 runs yielding, in none with the timer), Kokiri's worst frame went from 53-422 ms to 30 ms;
+   on 6 the frame rate stayed and a frame's CPU time fell 9 %. On 8 cores and more yielding stays: with the timer for all
+   sleeps there were no long frames either way and Kokiri lost 0.2 fps under its cap, and the timer made TOTK's 20 us waits
+   for its job workers 25x longer, ~2000 a second on the frame's critical path. */
+enum { SHORT_SLEEP_TIMER_THREADS = 6 };
 static int hos_short_sleep_timer(const char *asked, int threads) {
     if (asked) return env_value_off(asked) ? 0 : 2;
     return threads > 0 && threads <= SHORT_SLEEP_TIMER_THREADS ? 1 : 0;
-}
-/* Where the game's short sleeps yield (more than SHORT_SLEEP_TIMER_THREADS processors), at most this many of its
-   threads yield through one at the same time; the game's next short sleep then waits on the timer until one is back.
-   OoT's idle job workers all poll their queues in 20 us steps: the first few notice new work within ~20 us, the rest
-   stop keeping a processor busy each (as Go's scheduler keeps at most half of its idle threads looking for work, and
-   RPCS3 yields below its host quantum only on CPUs with few threads). The frame's serial threads (hos_thread_serial:
-   the game thread's wait for its own batch of jobs) and the host's sleeps always yield and are not counted.
-   asked: HOS_SHORT_SLEEP_POLLERS, NULL when not set: a number, 0 = no limit (every short sleep yields, as before); not
-   a number = not set. Not set: a quarter of the processors (4 of 16), none where they are not known. */
-static volatile LONG short_pollers;   /* (the game's threads in the yield loop now) */
-static int hos_short_sleep_pollers(const char *asked, int threads) {
-    char *end = NULL;
-    const long n = asked && *asked ? strtol(asked, &end, 10) : 0;
-    if (end && end != asked && *end == 0) return n > 0 ? (int)(n < 1024 ? n : 1024) : 0;
-    return threads > SHORT_SLEEP_TIMER_THREADS ? threads / 4 : 0;
 }
 /* (virtual cores: a sleep gives the core up, SleepThread(0) offers it to a waiter as good) guest: the game's own sleep */
 static void sleep_away(int64_t ns, int guest) {
@@ -1140,9 +929,9 @@ static void sleep_away(int64_t ns, int guest) {
 }
 void hos_sleep_ns(int64_t ns) { sleep_away(ns, 0); }
 static void sleep_ns(int64_t ns, int guest) {
-    /* A high-resolution waitable timer (one per thread) sleeps to within ~0.5 ms without spinning; Sleep() rounds to
-       the timer resolution, so without one the last millisecond is spun (threads that sleep in short steps, the
-       vibration thread for one, used 15% of a core spinning). */
+    /* A high-resolution waitable timer (one per thread) sleeps without spinning; Sleep() rounds to the timer resolution,
+       so without one the last millisecond is spun (threads that sleep in short steps, the vibration thread for one, used
+       15% of a core spinning). */
     static _Thread_local HANDLE timer;
     static _Thread_local int tried;
     int64_t until = hos_now_ns() + ns;
@@ -1166,57 +955,72 @@ static void sleep_ns(int64_t ns, int guest) {
     while (hos_now_ns() < until) sched_yield();
     return;
 #endif
-    /* Under a millisecond: yielded away until the time, or the timer for the game's own sleeps where the processors
-       are few (hos_short_sleep_timer). HOS_SHORT_SLEEP_TIMER=1: the timer always, 0: never, not set: by the processors */
-    /* (the choice, how | the cap << 2: one atomic word, so a thread sees both or neither) */
-    static int choice = -1;
-    int chosen = __atomic_load_n(&choice, __ATOMIC_RELAXED);
-    if (chosen < 0) {
-        const int threads = process_threads();   /* (0 elsewhere than Windows: the timer when asked for) */
-        int how = hos_short_sleep_timer(getenv("HOS_SHORT_SLEEP_TIMER"), threads);
-#if !defined(_WIN32)
-        /* (hookshot) Linux: the game's own sleeps wait on the timer whatever the processors, the host's still yield (1).
-           With #2602, OoT's five idle job workers and sead::MainThread yielded 3.3-3.6 ms a frame each in Hyrule Field
-           (RTX 3090, 7900X, 24 threads), ~9 ms of CPU a frame in all, while one of them waited on a GPU readback. With
-           the timer for all sleeps the frame's CPU fell 44.8 -> 35.4 ms at the same median frame (11.30 / 11.32 ms).
-           The job workers are not on the frame's critical path there (HOS_CHAIN), so their ~0.5 ms later wake costs
-           nothing measured; on 4-8 thread CPUs (the Steam Deck: 8) those yields took processors the frame needs.
-           HOS_SHORT_SLEEP_TIMER=0: all yield, as before; =1: all on the timer */
-        if (!getenv("HOS_SHORT_SLEEP_TIMER")) how = 1;
+    /* Under a millisecond: yielded away until the time, or the timer for the game's own sleeps where the cores are few
+       (hos_short_sleep_timer). HOS_SHORT_SLEEP_TIMER=1: the timer always, 0: never, not set: by the cores */
+    static volatile int short_timer = -1;
+    if (short_timer < 0) {
+        int logical = 0;
+#if defined(_WIN32)
+        /* (with more than one processor group the mask is one group's, not the process's: not known then) */
+        DWORD_PTR proc = 0, sys = 0;
+        if (GetActiveProcessorGroupCount() == 1 && GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys))
+            logical = __builtin_popcountll((uint64_t)proc);
+#else
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        if (sched_getaffinity(0, sizeof set, &set) == 0) logical = CPU_COUNT(&set);
 #endif
+        const int cores = physical_cores();
+        const int threads = logical > 0 && cores > 0 ? (logical < cores ? logical : cores) : logical > 0 ? logical : cores;
+        const int how = hos_short_sleep_timer(getenv("HOS_SHORT_SLEEP_TIMER"), threads);
         /* (the line says what was chosen, before any thread has made its timer: where the high-resolution timer cannot
            be made, Windows before 10 1803, a short sleep falls through to the yield loop at the end and nothing changes) */
         static volatile LONG told;
         if (how && !InterlockedExchange(&told, 1))
-            hos_log("sleep: %s sleeps under a millisecond wait on the timer where the high-resolution one can be made "
-                    "(%d logical processors, 0: not counted; HOS_SHORT_SLEEP_TIMER=0: all yield)",
-                    how == 2 ? "all" : "the game's", threads);
-        /* (HOS_SHORT_SLEEP_TIMER set says how all short sleeps wait: no limit then) */
-        const int cap = how || getenv("HOS_SHORT_SLEEP_TIMER") ? 0 : hos_short_sleep_pollers(getenv("HOS_SHORT_SLEEP_POLLERS"), threads);
-        if (cap && !InterlockedExchange(&told, 1))
-            hos_log("sleep: at most %d of the game's threads yield through a short sleep at a time, the others wait on the "
-                    "timer (%d logical processors; HOS_SHORT_SLEEP_POLLERS=0: all yield)", cap, threads);
-        chosen = how | cap << 2;
-        __atomic_store_n(&choice, chosen, __ATOMIC_RELAXED);
+            hos_log("sleep: %s sleeps under a millisecond wait on the high-resolution timer "
+                    "(%d cores, %d logical processors; HOS_SHORT_SLEEP_TIMER=0: all yield)",
+                    how == 2 ? "all" : "the game's", cores ? cores : threads, logical ? logical : threads);
+        short_timer = how;
     }
-    const int short_timer = chosen & 3, poll_cap = chosen >> 2;
     if (ns < 1000000 && short_timer < (guest ? 1 : 2)) {
-        const int counted = guest && poll_cap && !hos_thread_serial(hos_self());
-        if (!counted || InterlockedIncrement(&short_pollers) <= poll_cap) {
-            while (hos_now_ns() < until)
-                if (!SwitchToThread()) YieldProcessor();
-            if (counted) InterlockedDecrement(&short_pollers);
-            return;
-        }
-        InterlockedDecrement(&short_pollers);   /* (enough of them poll already: the timer, below) */
+        while (hos_now_ns() < until)
+            if (!SwitchToThread()) YieldProcessor();
+        return;
     }
+    int64_t wait_ns = ns;
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
+    /* Windows' high-resolution timer has a ~500 us floor of its own; Linux's clock_nanosleep wakes a 20 us poll after
+       20 us, which across OoT's 11 idle job workers is ~400k hrtimer interrupts and ~800k vc_lock acquisitions a second
+       and keeps Zen 2 cores out of C-states under a 15 W budget. Guest timer sleeps wait at least HOS_GUEST_MIN_SLEEP_US
+       (default 250; 0: as asked) and keep the kernel's 50 us timer slack unless the thread also paces host sleeps. */
+    int hires = !guest;
+    if (guest) {
+        static volatile int64_t guest_min_ns = -1;
+        int64_t min_ns = guest_min_ns;
+        if (min_ns < 0) {
+            const char *e = getenv("HOS_GUEST_MIN_SLEEP_US");
+            const long long us = e && *e ? atoll(e) : 250;
+            min_ns = us <= 0 ? 0 : (us > 10000 ? 10000 : (int64_t)us) * 1000;
+            guest_min_ns = min_ns;
+        }
+        if (wait_ns < min_ns) wait_ns = min_ns;
+        if (!min_ns) hires = 1;
+    }
+    const int want = hires ? 2 : 1;
+    if (tried < want) {
+        if (timer) CloseHandle(timer);
+        tried = want;
+        timer = CreateWaitableTimerExW(NULL, NULL, hires ? CREATE_WAITABLE_TIMER_HIGH_RESOLUTION : 0, TIMER_ALL_ACCESS);
+    }
+#else
     if (!tried) {
         tried = 1;
         timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
     }
+#endif
     if (timer) {
         LARGE_INTEGER due;
-        due.QuadPart = -(ns / 100 > 0 ? ns / 100 : 1);   /* relative, 100 ns units */
+        due.QuadPart = -(wait_ns / 100 > 0 ? wait_ns / 100 : 1);   /* relative, 100 ns units */
         if (SetWaitableTimerEx(timer, &due, 0, NULL, NULL, NULL, 0)) {
             WaitForSingleObject(timer, INFINITE);
             return;
@@ -1893,9 +1697,7 @@ static void vc_acquire(HosThread *t) {
             HosThread *h = vc_owner[k];
             if ((m >> k & 1) && h && h->priority > t->priority && (!worst || h->priority > worst->priority)) worst = h;
         }
-        const int64_t now = hos_now_ns();
-        const int64_t waited_pre = now - t0;
-        if (!worst && waited_pre > slice)
+        if (!worst && hos_now_ns() - t0 > slice)
             for (int k = 0; k < vc_cores() && !worst; k++)
                 if ((m >> k & 1) && vc_owner[k] && vc_owner[k]->priority == t->priority) worst = vc_owner[k];
         if (worst && !worst->vc_kick) {
@@ -1904,12 +1706,7 @@ static void vc_acquire(HosThread *t) {
             __atomic_store_n(rc ? &rc->poll : &worst->ctx.poll, 1, __ATOMIC_RELAXED);
             vc_st.kicks++;
         }
-        const int64_t esc_lim = worst ? esc_better : esc_eq;
-        const int64_t next_lim = (!worst && slice < esc_lim) ? slice : esc_lim;
-        const int64_t rem_ns = next_lim > waited_pre ? next_lim - waited_pre : 0;
-        DWORD wait_ms = (DWORD)((rem_ns + 999999) / 1000000);
-        if (!wait_ms) wait_ms = 1;
-        SleepConditionVariableSRW(&t->vc_cv, &vc_lock, wait_ms, 0);
+        SleepConditionVariableSRW(&t->vc_cv, &vc_lock, 1, 0);
         if (t->vc_held) break;   /* granted by a release */
         if ((c = vc_free_for(t)) >= 0) {
             vc_dequeue(t);

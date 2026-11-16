@@ -12,7 +12,6 @@
 #include "../gpu/vk/dlss_math.h"
 #include "control.h"
 
-#ifdef RX_NATIVE_WGPU
 /* the WebGPU renderer (gpu/render, renamed) */
 int wgr_start(void *hwnd);
 void wgr_resize(int width, int height);
@@ -36,40 +35,6 @@ void wgr_nvn_read_texels(const nvn_tex *t, unsigned level, unsigned layer0, cons
 void wgr_nvn_write_texels(const nvn_tex *t, unsigned level, unsigned layer0, const NVNcopyRegion *r,
                           const uint8_t *src, uint64_t row, uint64_t img);
 void wgr_nvn_invalidate(uint64_t gpu, uint64_t size);
-#elif defined(_WIN32)
-/* (Windows without wgpu-native: the back end's calls go nowhere. On Linux host/posix/linux_stubs.c has these, and
-   the Vulkan back end is built there anyway) */
-static int wgr_start(void *hwnd) { (void)hwnd; return 0; }
-static void wgr_resize(int w, int h) { (void)w, (void)h; }
-static const char *wgr_describe(void) { return "none (Vulkan failed)"; }
-static void wgr_stats(int64_t *d, int64_t *s, int64_t *p) { if (d) *d = 0; if (s) *s = 0; if (p) *p = 0; }
-static void wgr_nvn_submit(const uint64_t *h, int n) { (void)h, (void)n; }
-static uint64_t wgr_nvn_fence(void) { return 0; }
-static uint64_t wgr_nvn_pushed(void) { return 0; }
-static uint64_t wgr_nvn_replayed(void) { return 0; }
-static int wgr_nvn_wait(uint64_t f, uint64_t t) { (void)f, (void)t; return 1; }
-static void wgr_wait_writebacks_reading(const void *p, uint64_t n) { (void)p, (void)n; }
-static void wgr_nvn_finish(void) {}
-static void wgr_nvn_present(const nvn_tex *t, const int c[4]) { (void)t, (void)c; }
-static void wgr_nvn_register_texture(int id, const nvn_tex *t, const nvn_view *v) { (void)id, (void)t, (void)v; }
-static void wgr_nvn_register_sampler(int id, const nvn_samp_par *p) { (void)id, (void)p; }
-static void wgr_nvn_set_texture_pool_size(int n) { (void)n; }
-static void wgr_nvn_texture_released(const nvn_tex *t) { (void)t; }
-static void wgr_nvn_program_released(const nvn_prog *p) { (void)p; }
-static void wgr_nvn_read_texels(const nvn_tex *t, unsigned l, unsigned l0, const NVNcopyRegion *r, uint8_t *d,
-                                uint64_t row, uint64_t img) {
-    (void)t, (void)l, (void)l0, (void)r, (void)d, (void)row, (void)img;
-}
-static void wgr_nvn_write_texels(const nvn_tex *t, unsigned l, unsigned l0, const NVNcopyRegion *r, const uint8_t *s,
-                                 uint64_t row, uint64_t img) {
-    (void)t, (void)l, (void)l0, (void)r, (void)s, (void)row, (void)img;
-}
-static void wgr_nvn_invalidate(uint64_t g, uint64_t s) { (void)g, (void)s; }
-void rx_request_frame_dump(void) { hos_log("rx: !dump is WebGPU-only (use RX_VK_DUMP on Vulkan)"); }
-void rx_set_screenshot_ms(int64_t ms) { (void)ms; hos_log("rx: !shots is WebGPU-only (use RX_VK_SHOTS on Vulkan)"); }
-void rx_request_rdoc_capture(int frames) { (void)frames; hos_log("rx: !rdoc is WebGPU-only"); }
-void rx_flash_dark_arm(void) { hos_log("rx: !flasharm is WebGPU-only (use RX_VK_FLASH on Vulkan)"); }
-#endif
 
 /* what the Vulkan back end is given */
 uint8_t *hos_guest_base(void);
@@ -141,48 +106,20 @@ static int64_t collect_in(const uint64_t (*ranges)[2], int nranges, uint32_t **p
     return (int64_t)n;
 }
 static int64_t host_collect(uint32_t **pages) {
-    static int scoped = -1;
-#if defined(_WIN32)   /* (armed by the commit-on-touch handler; POSIX has mprotect but no handler to test the write) */
-    if (scoped < 0) scoped = getenv("RX_SCOPED_GUARD") && atoi(getenv("RX_SCOPED_GUARD")) != 0;
-#else
-    if (scoped < 0) scoped = 0;
-#endif
-    if (scoped) return hos_drain_dirty_pages(pages, 1);
     static uint64_t (*ranges)[2];
     if (!ranges) ranges = malloc(sizeof *ranges * 4096);
     return collect_in(ranges, hos_gpu_guest_ranges(ranges, 4096), pages);
 }
 /* (only within the given guest ranges: the submit-time capture of the mirrored pools, a small part of the 20 ms the
    whole collection takes) */
-static int64_t host_collect_in(const uint64_t (*ranges)[2], int n, uint32_t **pages) {
-    static int scoped = -1;
-#if defined(_WIN32)   /* (armed by the commit-on-touch handler; POSIX has mprotect but no handler to test the write) */
-    if (scoped < 0) scoped = getenv("RX_SCOPED_GUARD") && atoi(getenv("RX_SCOPED_GUARD")) != 0;
-#else
-    if (scoped < 0) scoped = 0;
-#endif
-    if (scoped) return hos_drain_dirty_pages(pages, 1);
-    return collect_in(ranges, n, pages);
-}
+static int64_t host_collect_in(const uint64_t (*ranges)[2], int n, uint32_t **pages) { return collect_in(ranges, n, pages); }
 #else
 static int64_t host_collect(uint32_t **pages) {
-#if defined(_WIN32)
-    if (getenv("RX_SCOPED_GUARD") && atoi(getenv("RX_SCOPED_GUARD")) != 0)
-        return hos_drain_dirty_pages(pages, 1);
-#endif
     int64_t n = -1;
     *pages = rx_collect_written(&n);
     return n;
 }
-static int64_t host_collect_in(const uint64_t (*ranges)[2], int n, uint32_t **pages) {
-    (void)ranges, (void)n;
-#if defined(_WIN32)
-    if (getenv("RX_SCOPED_GUARD") && atoi(getenv("RX_SCOPED_GUARD")) != 0)
-        return hos_drain_dirty_pages(pages, 1);
-#endif
-    *pages = 0;
-    return 0;
-}
+static int64_t host_collect_in(const uint64_t (*ranges)[2], int n, uint32_t **pages) { (void)ranges, (void)n; *pages = 0; return 0; }
 #endif
 static void host_free_pages(uint32_t *pages) { free(pages); }
 static void host_mark_written(const void *p, uint64_t n) {
@@ -204,20 +141,6 @@ static uint64_t host_guest_alloc(uint64_t size) {
 void hos_watch_guest_writes(const uint8_t *data, uint64_t size);   /* nvn_native.c */
 static void host_watch_guest_writes(uint64_t guest, uint64_t size) { hos_watch_guest_writes(hos_guest_base() + guest, size); }
 static float host_aspect_ratio(void) { return hos_aspect_ratio; }
-#ifndef _WIN32
-int hos_sdl_desktop_size(int *width, int *height);   /* hos_sdl.c */
-#endif
-/* (hookshot) the main screen's size, as host/hos_main.c takes its shape (MkwVkHost.screen_size) */
-static int host_screen_size(int *width, int *height) {
-#ifdef _WIN32
-    const int w = GetSystemMetrics(SM_CXSCREEN), h = GetSystemMetrics(SM_CYSCREEN);
-    if (w <= 0 || h <= 0) return 0;
-    *width = w, *height = h;
-    return 1;
-#else
-    return hos_sdl_desktop_size(width, height);
-#endif
-}
 static float host_wide_menus(uint32_t keep_mask) {   /* (MkwVkHost.wide_menus) */
     extern volatile uint32_t hos_wide_keep_mask;
     extern volatile float hos_wide_margin;
@@ -263,7 +186,7 @@ static const MkwVkHost vk_host = {
     hos_gpu_maps_generation, nvn_vmap_generation, hos_reserved_cpus, host_collect_in, host_guest_alloc,
     host_watch_guest_writes, hos_pad_raw, hos_binding, hos_bind, host_aspect_ratio, host_take_key_press,
     hos_mouse_pointer, hos_mic_count, hos_mic_name, hos_mic_select, hos_sdl_gyro_status, hos_log_flush, hos_prompts_face,
-    host_romfs_dir, host_wide_menus, host_slept_ns, host_fps_timing, hos_prompts_live_parts, host_screen_size,
+    host_romfs_dir, host_wide_menus, host_slept_ns, host_fps_timing, hos_prompts_live_parts,
 };
 
 static const MkwVkRenderer *vk;   /* the Vulkan back end, when it was chosen and started */
@@ -500,9 +423,6 @@ void rx_nvn_texture_created(const nvn_tex *t) {
     if (vk && vk->nvn_texture_created) vk->nvn_texture_created(t);
 }
 void rx_nvn_program_released(const nvn_prog *p) { vk ? vk->nvn_program_released(p) : wgr_nvn_program_released(p); }
-void rx_nvn_program_created(const nvn_prog *p) {
-    if (vk && vk->nvn_program_created) vk->nvn_program_created(p);
-}
 void rx_nvn_read_texels(const nvn_tex *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, uint8_t *dst,
                         size_t row, size_t img) {
     vk ? vk->nvn_read_texels(t, level, layer0, r, dst, row, img) : wgr_nvn_read_texels(t, level, layer0, r, dst, row, img);
