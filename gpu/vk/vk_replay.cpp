@@ -2454,18 +2454,35 @@ void invalidate(uint64_t gpu, uint64_t size) {
             }
         }
     }
-    {   // (hookshot, diagnostics) RX_VK_LOG_READ_VALUES=1: the first words the CPU reads from small readback ranges,
-        // after the wait or the copy, from present 2000 on (2000 lines)
-        static const bool on = env_on("RX_VK_LOG_READ_VALUES");
+    {   // (hookshot, diagnostics) RX_VK_LOG_READ_VALUES=<lines>: what the CPU reads from small readback ranges, after the
+        // wait or the copy, from present 2000 on: its total as floats, and its words up to 256 bytes (1: 2000 lines)
+        static const int lines = [] {
+            const char* e = getenv("RX_VK_LOG_READ_VALUES");
+            const int v = e ? atoi(e) : 0;
+            return v == 1 ? 2000 : v;
+        }();
         static std::atomic<int> n{0};
-        if (on && size && size <= (1u << 20) && presents_now >= 2000 && n < 2000) {
+        if (lines > 0 && size && size <= (1u << 20) && presents_now >= 2000 && n < lines) {
             bool ever = false;
             memory_writeback_value(host->gpu_guest(gpu), size, &ever);
-            if (ever && n++ < 2000) {
+            if (ever && n++ < lines) {
+                std::vector<float> all(size / 4);
+                host->gpu_read(gpu, all.data(), all.size() * 4);
+                double total = 0;
+                for (const float f : all)
+                    if (std::isfinite(f) && std::fabs(f) < 1e30f) total += f;
                 uint32_t w[4]{};
-                host->gpu_read(gpu, w, sizeof w);
-                logf("vk: read values %lld %#llx +%#llx | %08x %08x %08x %08x", (long long)presents_now,
-                     (unsigned long long)gpu, (unsigned long long)size, w[0], w[1], w[2], w[3]);
+                std::memcpy(w, all.data(), std::min<size_t>(sizeof w, all.size() * 4));
+                std::string words;
+                if (size <= 256)
+                    for (size_t i = 0; i < all.size(); i++) {
+                        char b[12];
+                        std::snprintf(b, sizeof b, " %08x", ((const uint32_t*)all.data())[i]);
+                        words += b;
+                    }
+                logf("vk: read values %lld %#llx +%#llx | %08x %08x %08x %08x | total %.6g%s%s", (long long)presents_now,
+                     (unsigned long long)gpu, (unsigned long long)size, w[0], w[1], w[2], w[3], total,
+                     words.empty() ? "" : " | words", words.c_str());
             }
         }
     }

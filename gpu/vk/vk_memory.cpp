@@ -2577,10 +2577,16 @@ void memory_note_readback(uint64_t guest, uint64_t size) {
 // itself, and the CPU's read waits for the work that writes it (invalidate). OoT's exposure meter is one: a sum the GPU
 // adds to and the CPU reads and sets to 0, read once a frame for the frame before, while the replay is still recording
 // that frame: the game's thread held ~22 ms of a ~51 ms frame on the Deck. Here, once the CPU has waited on a range, a
-// binding inside it is written in a copy of its own instead, filled from guest memory when its recording first binds it
-// (the CPU's 0), and the CPU's read is handed the newest copy the GPU has finished, without waiting: the sum of a frame
-// one or two frames older at most, never the 0 the CPU left there or a sum added on top of an old one. Four copies a
-// range; with none free the binding is written in place, as without it
+// binding inside it is written in a copy of its own instead, and the CPU's read is handed the newest copy the GPU has
+// finished, without waiting: one or two frames older at most.
+// A new copy starts as guest memory would be in place: the GPU's newest copy (copied on the GPU, at the start of the
+// recording, after the one that writes it: some of these the GPU carries from frame to frame, as the exposure's
+// adaptation), with the words the CPU changed since it last saw them (the meter's 0) over it. A copy filled from guest
+// memory instead had the GPU go on from what the CPU was handed, a frame or two old, every frame: the exposure crept
+// up and up. What the CPU saw last (shadow) tells its changes. A read hands the CPU the copy whole and keeps the
+// changes it covers (pending) for the next copy: keeping them in guest memory instead had the CPU read its own reset
+// until a copy made after it was finished, a frame or two, at most reads. Four copies a range; with none free the
+// binding is written in place, as without it
 namespace {
 struct PrivCopy {
     VkBuffer buffer = VK_NULL_HANDLE;
@@ -2589,11 +2595,22 @@ struct PrivCopy {
     uint64_t value = 0;   // (the recording that writes it; 0: never used)
 };
 struct PrivRange {
-    uint64_t size = 0;
+    uint64_t base = 0, hi = 0;   // (the copies hold [base, hi): the read range from its start aligned down, so a binding
+                                 // inside keeps its offset's alignment)
     PrivCopy copies[4];
+    std::vector<uint8_t> shadow;   // ([base, hi) as the CPU last saw it from us: a word that differs, the CPU wrote)
+    std::vector<uint8_t> pending;   // (the CPU's words a read covered before a copy took them: their values)
+    std::vector<bool> pending_set;  // (a word each: whether pending has it)
 };
+/// a new copy's starting contents, recorded at the start of its recording (memory_private_refresh)
+struct PrivInit {
+    VkBuffer from, to;
+    uint64_t n;
+    std::vector<std::pair<uint64_t, std::vector<uint8_t>>> cpu;   // (the runs of words the CPU changed: offset, bytes)
+};
+thread_local std::vector<PrivInit> priv_inits;   // (the recording on this thread: its uploads take them)
 std::mutex priv_mu;
-std::map<uint64_t, PrivRange> priv_ranges;                 // (guest address of a binding -> its copies)
+std::map<uint64_t, PrivRange> priv_ranges;                 // (a read range's start -> its copies)
 std::vector<std::pair<uint64_t, uint64_t>> priv_reads;     // (ranges the CPU waited on: [lo, hi))
 std::atomic<bool> priv_any{false};
 std::atomic<int64_t> priv_served{0}, priv_older{0}, priv_inplace{0};
@@ -2622,50 +2639,119 @@ void memory_private_note_read(uint64_t guest, uint64_t size) {
     static std::map<std::pair<uint64_t, uint64_t>, int> seen;
     if (++seen[{guest, size}] < 2) return;
     if (seen.size() > 4096) seen.clear();
-    priv_reads.push_back({guest, guest + size});
+    // (a range overlapping ones already kept: joined with them, their copies left (a binding then finds the joined one))
+    uint64_t lo = guest, hi = guest + size;
+    for (auto it = priv_reads.begin(); it != priv_reads.end();) {
+        if (it->first < hi && lo < it->second) {
+            lo = std::min(lo, it->first), hi = std::max(hi, it->second);
+            priv_ranges.erase(it->first);
+            it = priv_reads.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    priv_reads.push_back({lo, hi});
     priv_any = true;
     logf("vk: readback range %#llx +%#llx: its bindings written in copies of their own from now on",
-         (unsigned long long)guest, (unsigned long long)size);
+         (unsigned long long)lo, (unsigned long long)(hi - lo));
 }
 bool memory_private_bind(uint64_t guest, uint64_t size, BufferRef& out) {
     if (!priv_any.load(std::memory_order_relaxed) || !size) return false;
+    static const bool log_binds = env_on("RX_VK_LOG_PRIVATE");
     std::lock_guard lk(priv_mu);
-    bool inside = false;
-    for (const auto& r : priv_reads)
-        if (guest >= r.first && guest + size <= r.second) inside = true;
-    if (!inside) return false;
-    auto it = priv_ranges.find(guest);
-    if (it != priv_ranges.end() && it->second.size != size) return false;   // (bound at another size: in place)
-    PrivRange& r = priv_ranges[guest];
-    r.size = size;
-    for (PrivCopy& c : r.copies)
-        if (c.value == mem_rec_value && c.buffer) {
-            out = {c.buffer, 0, size, 0};
-            return true;
-        }
-    const uint64_t done = vk_timeline_completed();
-    const PrivCopy* keep = newest_done(r, done);
+    // (every binding inside a read range writes one copy of the whole range: a clear of the range and the adds into a
+    // part of it are the same memory, as they are in place. A copy per binding had the clear zero one copy and the adds
+    // go on in another, which still held the sum handed to the CPU the frame before: the exposure meter added up frame
+    // after frame, and the picture grew brighter and brighter)
+    const std::pair<uint64_t, uint64_t>* in = nullptr;
+    for (const auto& rr : priv_reads)
+        if (guest >= rr.first && guest + size <= rr.second) in = &rr;
+    if (!in) return false;
+    PrivRange& r = priv_ranges[in->first];
+    if (!r.hi) r.base = in->first & ~(storage_binding_align() - 1), r.hi = in->second;
+    const uint64_t n = r.hi - r.base;
     PrivCopy* use = nullptr;
     for (PrivCopy& c : r.copies)
-        if (&c != keep && c.value <= done && (!use || c.value < use->value)) use = &c;
+        if (c.value == mem_rec_value && c.buffer) use = &c;
     if (!use) {
-        if (priv_inplace++ % 100 == 0)
-            logf("vk: readback copies of %#llx all in use: written in place (%lld so)", (unsigned long long)guest,
-                 (long long)priv_inplace.load());
-        return false;
-    }
-    if (!use->buffer) {
-        void* m = nullptr;
-        if (!create_buffer_cached(size, kUsage, use->buffer, use->alloc, &m, false)) {
-            use->buffer = VK_NULL_HANDLE;
+        const uint64_t done = vk_timeline_completed();
+        const PrivCopy* keep = newest_done(r, done);
+        for (PrivCopy& c : r.copies)
+            if (&c != keep && c.value <= done && (!use || c.value < use->value)) use = &c;
+        if (!use) {
+            if (priv_inplace++ % 100 == 0)
+                logf("vk: readback copies of %#llx all in use: written in place (%lld so)", (unsigned long long)in->first,
+                     (long long)priv_inplace.load());
             return false;
         }
-        use->mapped = (uint8_t*)m;
+        if (!use->buffer) {
+            void* m = nullptr;
+            if (!create_buffer_cached(n, kUsage, use->buffer, use->alloc, &m, false)) {
+                use->buffer = VK_NULL_HANDLE;
+                return false;
+            }
+            use->mapped = (uint8_t*)m;
+        }
+        const uint8_t* g = host->guest_base() + r.base;
+        const PrivCopy* prev = nullptr;   // (the GPU's newest, finished or not)
+        for (const PrivCopy& c : r.copies)
+            if (&c != use && c.value && c.value < mem_rec_value && (!prev || c.value > prev->value)) prev = &c;
+        if (!prev || r.shadow.size() != n) {   // (the first: guest memory as it is)
+            std::memcpy(use->mapped, g, n);
+            flush_mapped(use->alloc, n);
+        } else {
+            // (the CPU's words: written since it last saw them, or held for this from a read (pending), as runs)
+            std::vector<uint8_t> w(g, g + n);
+            std::vector<bool> cpu(n / 4);
+            for (uint64_t k = 0; k < n / 4; k++) {
+                if (std::memcmp(g + k * 4, r.shadow.data() + k * 4, 4)) cpu[k] = true;
+                else if (k < r.pending_set.size() && r.pending_set[k]) cpu[k] = true, std::memcpy(&w[k * 4], &r.pending[k * 4], 4);
+            }
+            PrivInit init{prev->buffer, use->buffer, n, {}};
+            for (uint64_t k = 0; k < n / 4;) {
+                if (!cpu[k]) { k++; continue; }
+                uint64_t j = k + 1;
+                while (j < n / 4 && cpu[j]) j++;
+                init.cpu.push_back({k * 4, std::vector<uint8_t>(w.begin() + k * 4, w.begin() + j * 4)});
+                k = j;
+            }
+            priv_inits.push_back(std::move(init));
+        }
+        r.shadow.assign(g, g + n);   // (taken: the copy has them now)
+        r.pending_set.assign(n / 4, false);
+        use->value = mem_rec_value;
     }
-    std::memcpy(use->mapped, host->guest_base() + guest, size);
-    flush_mapped(use->alloc, size);
-    use->value = mem_rec_value;
-    out = {use->buffer, 0, size, 0};
+    static std::atomic<int> nb{0};
+    if (log_binds && nb++ < 400)
+        logf("vk: private bind %#llx +%#llx in %#llx +%#llx: recording %llu", (unsigned long long)guest,
+             (unsigned long long)size, (unsigned long long)in->first, (unsigned long long)(in->second - in->first),
+             (unsigned long long)mem_rec_value);
+    out = {use->buffer, guest - r.base, size, 0};
+    return true;
+}
+bool memory_private_refresh(VkCommandBuffer up) {
+    if (priv_inits.empty()) return false;
+    if (!up) {
+        static std::atomic<int> n{0};
+        if (n++ < 8) logf("vk: readback copies: %zu made without an upload command buffer: left as they were", priv_inits.size());
+        priv_inits.clear();
+        return false;
+    }
+    full_barrier(up);   // (after the recordings ahead of this one that write the copies they start from)
+    for (const PrivInit& in : priv_inits) {
+        const VkBufferCopy c{0, 0, in.n};
+        vkCmdCopyBuffer(up, in.from, in.to, 1, &c);
+    }
+    bool cpu = false;
+    for (const PrivInit& in : priv_inits) cpu = cpu || !in.cpu.empty();
+    if (cpu) {
+        full_barrier(up);
+        for (const PrivInit& in : priv_inits)
+            for (const auto& [off, bytes] : in.cpu)
+                for (uint64_t k = 0; k < bytes.size(); k += 65536)
+                    vkCmdUpdateBuffer(up, in.to, off + k, std::min<uint64_t>(65536, bytes.size() - k), bytes.data() + k);
+    }
+    priv_inits.clear();
     return true;
 }
 bool memory_private_read(uint64_t guest, uint64_t size) {
@@ -2675,7 +2761,7 @@ bool memory_private_read(uint64_t guest, uint64_t size) {
     const uint64_t done = vk_timeline_completed();
     bool any = false;
     for (auto& [lo, r] : priv_ranges) {
-        if (lo + r.size <= guest || lo >= guest + size) continue;
+        if (r.hi <= guest || lo >= guest + size) continue;
         PrivCopy* c = newest_done(r, done);
         if (!c) {   // (none finished yet: the read waits, as without it)
             static std::atomic<int> nl{0};
@@ -2683,13 +2769,27 @@ bool memory_private_read(uint64_t guest, uint64_t size) {
                 std::string vs;
                 for (const PrivCopy& o : r.copies) vs += " " + std::to_string(o.value);
                 logf("vk: private read %#llx +%#llx (read %#llx +%#llx): no finished copy (done %llu, copies%s)",
-                     (unsigned long long)lo, (unsigned long long)r.size, (unsigned long long)guest,
+                     (unsigned long long)lo, (unsigned long long)(r.hi - lo), (unsigned long long)guest,
                      (unsigned long long)size, (unsigned long long)done, vs.c_str());
             }
             return false;
         }
-        invalidate_mapped(c->alloc, r.size);
-        std::memcpy(host->guest_base() + lo, c->mapped, r.size);
+        // (the read range itself: the bytes below it, from the aligned start, are the CPU's. A word the CPU wrote since
+        // it last saw it from us, and no copy has taken yet, goes to pending for the next copy)
+        invalidate_mapped(c->alloc, r.hi - r.base);
+        uint8_t* g = host->guest_base();
+        const uint64_t span = r.hi - r.base;
+        const bool known = r.shadow.size() == span;
+        if (known && r.pending_set.size() != span / 4) r.pending_set.assign(span / 4, false);
+        if (known && r.pending.size() != span) r.pending.assign(span, 0);
+        for (uint64_t i = (lo - r.base) & ~3ull; i + 4 <= span; i += 4) {
+            if (known && std::memcmp(g + r.base + i, r.shadow.data() + i, 4)) {
+                std::memcpy(&r.pending[i], g + r.base + i, 4);
+                r.pending_set[i / 4] = true;
+            }
+            std::memcpy(g + r.base + i, c->mapped + i, 4);
+            if (known) std::memcpy(r.shadow.data() + i, c->mapped + i, 4);
+        }
         uint64_t newest = 0;
         for (const PrivCopy& o : r.copies) newest = std::max(newest, o.value);
         const bool older = newest > c->value;
@@ -2699,7 +2799,7 @@ bool memory_private_read(uint64_t guest, uint64_t size) {
             logf("vk: readbacks handed a finished copy: %lld, %lld of them older than the newest recording",
                  (long long)priv_served.load(), (long long)priv_older.load());
         if (log_vals && n < 2000) {
-            const uint32_t* w = (const uint32_t*)c->mapped;
+            const uint32_t* w = (const uint32_t*)(c->mapped + (lo - r.base));
             logf("vk: private read %#llx value %llu newest %llu done %llu | %08x %08x %08x %08x", (unsigned long long)lo,
                  (unsigned long long)c->value, (unsigned long long)newest, (unsigned long long)done, w[0], w[1], w[2], w[3]);
         }
