@@ -2391,8 +2391,20 @@ void invalidate(uint64_t gpu, uint64_t size) {
     if (size) {
         static const bool off = env_on("RX_VK_NO_READBACK_WAIT");
         bool ever = false;
-        if (!off && (memory_writeback_value(host->gpu_guest(gpu), size, &ever), ever)) {
+        // (hookshot) RX_VK_READBACK_PRIVATE=1: handed the newest finished copy instead (vk_memory.cpp), no wait
+        if (!off && !memory_private_read(host->gpu_guest(gpu), size) &&
+            (memory_writeback_value(host->gpu_guest(gpu), size, &ever), ever)) {
+            memory_private_note_read(host->gpu_guest(gpu), size);
             memory_note_readback(host->gpu_guest(gpu), size);   // (PR 430: the CPU may write it back: memory_rb_refresh)
+            {   // (hookshot, diagnostics) RX_VK_LOG_PRIVATE=1: the reads that still wait
+                static const bool lp = env_on("RX_VK_LOG_PRIVATE");
+                static std::atomic<int> nw{0};
+                const uint64_t vv = memory_writeback_value(host->gpu_guest(gpu), size, nullptr);
+                if (lp && presents_now >= 2000 && vv > completed() && nw++ < 300)
+                    logf("vk: private: read %#llx +%#llx waits (value %llu, done %llu, behind %d)",
+                         (unsigned long long)host->gpu_guest(gpu), (unsigned long long)size, (unsigned long long)vv,
+                         (unsigned long long)completed(), (int)replay_behind());
+            }
             static std::atomic<int64_t> calls{0}, waited{0}, ns{0};
             const auto w0 = std::chrono::steady_clock::now();
             bool w = false;
@@ -2439,6 +2451,21 @@ void invalidate(uint64_t gpu, uint64_t size) {
                 const int64_t n = waited.exchange(0);
                 logf("vk: readbacks of GPU results: %lld of 3000 waited for their write-back, %.2f ms each", (long long)n,
                      n ? ns.exchange(0) / (double)n / 1e6 : 0.0);
+            }
+        }
+    }
+    {   // (hookshot, diagnostics) RX_VK_LOG_READ_VALUES=1: the first words the CPU reads from small readback ranges,
+        // after the wait or the copy, from present 2000 on (2000 lines)
+        static const bool on = env_on("RX_VK_LOG_READ_VALUES");
+        static std::atomic<int> n{0};
+        if (on && size && size <= (1u << 20) && presents_now >= 2000 && n < 2000) {
+            bool ever = false;
+            memory_writeback_value(host->gpu_guest(gpu), size, &ever);
+            if (ever && n++ < 2000) {
+                uint32_t w[4]{};
+                host->gpu_read(gpu, w, sizeof w);
+                logf("vk: read values %lld %#llx +%#llx | %08x %08x %08x %08x", (long long)presents_now,
+                     (unsigned long long)gpu, (unsigned long long)size, w[0], w[1], w[2], w[3]);
             }
         }
     }

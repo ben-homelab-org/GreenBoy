@@ -250,6 +250,10 @@ void memory_drop_shadow(uint64_t guest, uint64_t size);   // (a write the captur
 /// when any write-back ever did
 uint64_t memory_writeback_value(uint64_t guest, uint64_t size, bool* ever);
 void memory_note_readback(uint64_t guest, uint64_t size);   // (PR 430) a CPU read of GPU results: see memory_rb_refresh
+// (hookshot) RX_VK_READBACK_PRIVATE=1: GPU results the CPU reads every frame, written in copies of their own (vk_memory.cpp)
+void memory_private_note_read(uint64_t guest, uint64_t size);
+bool memory_private_read(uint64_t guest, uint64_t size);
+bool memory_private_bind(uint64_t guest, uint64_t size, BufferRef& out);
 bool memory_rb_refresh(VkCommandBuffer up);
 void memory_rb_recording_begun();   // (hookshot) at a recording's start, on its thread: the submission it joins (memory_rb_refresh)
 void memory_rb_segments_begin(uint64_t base, uint64_t n);   // (and a parallel replay's segments: their order, base on)
